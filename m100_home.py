@@ -1887,7 +1887,7 @@ SCREENSAVER_SCENES = [
     (_screensaver_marquee_line, lambda: {'pos': 0}),
 ]
 
-SCREENSAVER_LINES_PER_SCENE = 15  # ~7.5s per scene at 500ms/line
+SCREENSAVER_LINES_PER_SCENE = 20  # ~10s per scene at 500ms/line
 
 
 def screensaver_flow():

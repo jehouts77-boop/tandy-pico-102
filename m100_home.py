@@ -419,18 +419,36 @@ def wifi_disconnect_flow():
 #
 # Added 2026-09-16 so the Pico can update its own code over WiFi once
 # it's sealed inside the Model 102's case and no longer easy to plug
-# into a laptop. Reuses the same Apps Script relay already deployed for
-# Notes (NOTES_URL/NOTES_SECRET in secrets.py) - two new actions,
-# ota_version and ota_program, were added there instead of standing up
-# a second Google project or a GitHub account.
+# into a laptop. First built on top of the Notes Apps Script relay
+# (DriveApp storage), then briefly redesigned around a Google Doc, but
+# BOTH were abandoned 2026-09-16 after discovering DriveApp access is
+# blocked for anonymous/external callers on an unverified Apps Script
+# project - it works fine when run by hand in the script editor, but
+# fails every time when hit via the deployed /exec URL, no matter how
+# many times permissions are granted or the deployment is redeployed
+# (a Google policy thing, not a bug in that code). Landed on a **public
+# GitHub repo** instead: github.com/jehouts77-boop/tandy-pico-102,
+# holding just this one file. No secret/token needed at all since it's
+# public - simpler than any of the Google-based designs, and immune to
+# the Google Doc plan's rich-text corruption risk, since git stores
+# exact bytes rather than something a word processor could autocorrect.
 #
 # Versioning has no separate number to maintain by hand: the "remote
-# version" is just the Drive file's own last-modified timestamp
-# (handleOtaVersion() in apps_script_notes.gs), which updates itself
-# automatically whenever a new version of the file is uploaded to
-# Drive. The Pico remembers whichever timestamp it last installed in a
-# small local file (OTA_LOCAL_VERSION_FILE) and compares the two - no
-# match required beyond "did this change."
+# version" is the file's git blob SHA, read from GitHub's Contents API
+# (a small JSON response, cheap to poll) - it changes automatically
+# every time the file's content changes, no matter how the update gets
+# pushed (web UI upload, git push, editing directly on github.com). The
+# Pico remembers whichever SHA it last installed in a small local file
+# (OTA_LOCAL_VERSION_FILE) and compares the two - no match required
+# beyond "did this change." The actual program bytes come from a
+# separate plain-text fetch to raw.githubusercontent.com - the Contents
+# API response also embeds the content, but base64-encoded and capped
+# for large files, so a plain raw fetch is simpler with no size games.
+#
+# To publish a future update: replace m100_home.py in that repo (the
+# GitHub web UI's "Upload files", overwriting the existing one, is
+# easiest - no git command line needed) and the Pico picks up the new
+# SHA automatically next time SOFTWARE UPDATE > CHECK FOR UPDATES runs.
 #
 # Safety: a download is written to a temp file first and only swapped
 # into place after it completely finishes and passes a basic sanity
@@ -440,6 +458,11 @@ def wifi_disconnect_flow():
 # any laptop access, since that's the whole point once this is inside
 # a closed case.
 # ---------------------------------------------------------------------
+
+OTA_GH_OWNER = 'jehouts77-boop'
+OTA_GH_REPO = 'tandy-pico-102'
+OTA_GH_BRANCH = 'main'
+OTA_GH_PATH = 'm100_home.py'
 
 OTA_MAIN_FILENAME = 'main.py'        # the file MicroPython boots from
 OTA_BACKUP_FILENAME = 'main_prev.py'
@@ -463,17 +486,43 @@ def _ota_write_local_version(version):
         f.write(version)
 
 
-def _ota_fetch(action, max_bytes):
-    if not getattr(secrets, 'NOTES_URL', ''):
-        return False, 'NOTES_URL NOT SET IN secrets.py'
-
+def _ota_check_version():
+    """Fetches the program file's current git blob SHA from GitHub's
+    Contents API - a small JSON response (a couple KB, not the whole
+    ~60KB program) that changes automatically whenever the file's
+    content changes. No auth needed - the repo is public. Reuses
+    _json_str_after() (see the Text Browser / ON THIS DAY section
+    below) to pull the "sha" field out by hand rather than a full JSON
+    parse, same reasoning as onthisday_fetch(). Returns (True, sha) or
+    (False, message)."""
     wlan = connect_wifi()
     if wlan is None:
         return False, 'NO WIFI'
-    url = '{}?secret={}&action={}'.format(
-        secrets.NOTES_URL, url_quote(secrets.NOTES_SECRET), action)
+    url = 'https://api.github.com/repos/{}/{}/contents/{}?ref={}'.format(
+        OTA_GH_OWNER, OTA_GH_REPO, OTA_GH_PATH, OTA_GH_BRANCH)
     try:
-        status, body = http_get(url, max_bytes=max_bytes)
+        status, body = http_get(url, user_agent=WIKI_USER_AGENT, max_bytes=4096)
+    except Exception as e:
+        return False, 'NETWORK ERROR: {}'.format(e)
+    if status != 200:
+        return False, 'SERVER STATUS {}'.format(status)
+    sha = _json_str_after(body, '"sha":"')
+    if not sha:
+        return False, 'BAD RESPONSE FROM GITHUB'
+    return True, sha
+
+
+def _ota_fetch_program():
+    """Downloads the actual program file straight from GitHub's raw
+    content host - plain source text exactly as committed, no JSON
+    wrapper and no base64 to decode."""
+    wlan = connect_wifi()
+    if wlan is None:
+        return False, 'NO WIFI'
+    url = 'https://raw.githubusercontent.com/{}/{}/{}/{}'.format(
+        OTA_GH_OWNER, OTA_GH_REPO, OTA_GH_BRANCH, OTA_GH_PATH)
+    try:
+        status, body = http_get(url, user_agent=WIKI_USER_AGENT, max_bytes=OTA_MAX_BYTES)
     except Exception as e:
         return False, 'NETWORK ERROR: {}'.format(e)
     if status != 200:
@@ -483,14 +532,13 @@ def _ota_fetch(action, max_bytes):
 
 def ota_check_flow():
     send_screen(['SOFTWARE UPDATE', 'CHECKING...', '', '', '', ''])
-    ok, remote_version = _ota_fetch('ota_version', 256)
+    ok, remote_version = _ota_check_version()
     if not ok:
         send_screen(['SOFTWARE UPDATE', 'COULD NOT CHECK:',
                       remote_version[:COLS], '', '', '0=CONTINUE'])
         read_line()
         return
 
-    remote_version = remote_version.strip()
     local_version = _ota_read_local_version()
     if remote_version == local_version:
         send_screen(['SOFTWARE UPDATE', 'ALREADY UP TO DATE.', '', '', '',
@@ -505,7 +553,7 @@ def ota_check_flow():
         return
 
     send_screen(['SOFTWARE UPDATE', 'DOWNLOADING...', '', '', '', ''])
-    ok, body = _ota_fetch('ota_program', OTA_MAX_BYTES)
+    ok, body = _ota_fetch_program()
     if not ok:
         send_screen(['SOFTWARE UPDATE', 'DOWNLOAD FAILED:', body[:COLS],
                       '', 'NOTHING CHANGED.', '0=CONTINUE'])

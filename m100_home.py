@@ -2185,23 +2185,27 @@ def _programs_list_remote():
     return True, entries
 
 
-def _programs_fetch_file(name):
-    """Downloads one program file's plain contents from
-    raw.githubusercontent.com - same idea as OTA's _ota_fetch_program(),
-    just parameterized by filename."""
+def _programs_fetch_file(name, dest_path):
+    """Downloads one program file straight to dest_path on the Pico's
+    flash, streamed via http_download_to_file() rather than buffered
+    in RAM - same fix as OTA's _ota_fetch_program() (see that function
+    for the MemoryError this avoids), applied here too even though
+    individual program listings are normally small - no reason to
+    reintroduce the same risk for a library that's only going to grow."""
     wlan = connect_wifi()
     if wlan is None:
         return False, 'NO WIFI'
     url = 'https://raw.githubusercontent.com/{}/{}/{}/{}/{}'.format(
         OTA_GH_OWNER, OTA_GH_REPO, OTA_GH_BRANCH, OTA_GH_PROGRAMS_DIR, name)
     try:
-        status, body = http_get(url, user_agent=WIKI_USER_AGENT,
-                                 max_bytes=PROGRAMS_MAX_BYTES)
+        status, total = http_download_to_file(url, dest_path,
+                                               user_agent=WIKI_USER_AGENT,
+                                               max_bytes=PROGRAMS_MAX_BYTES)
     except Exception as e:
         return False, 'NETWORK ERROR: {}'.format(e)
     if status != 200:
         return False, 'SERVER STATUS {}'.format(status)
-    return True, body
+    return True, total
 
 
 def programs_sync_flow():
@@ -2230,16 +2234,13 @@ def programs_sync_flow():
             continue
         is_new = name not in manifest
         send_screen(['SYNC LIBRARY', 'DOWNLOADING:', name[:COLS], '', '', ''])
-        ok, body = _programs_fetch_file(name)
+        dest_path = '{}/{}'.format(PROGRAMS_LOCAL_DIR, name)
+        ok, result = _programs_fetch_file(name, dest_path)
         if not ok:
-            failed += 1
-            continue
-        if isinstance(body, str):
-            body = body.encode('utf-8')
-        try:
-            with open('{}/{}'.format(PROGRAMS_LOCAL_DIR, name), 'wb') as f:
-                f.write(body)
-        except Exception:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
             failed += 1
             continue
         manifest[name] = sha

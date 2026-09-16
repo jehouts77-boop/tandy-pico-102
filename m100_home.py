@@ -514,20 +514,55 @@ def _ota_check_version():
 
 def _ota_fetch_program():
     """Downloads the actual program file straight from GitHub's raw
-    content host - plain source text exactly as committed, no JSON
-    wrapper and no base64 to decode."""
+    content host into OTA_NEW_FILENAME on disk - plain source text
+    exactly as committed, no JSON wrapper and no base64 to decode.
+
+    FIX 2026-09-16: used to fetch the whole file into RAM via
+    http_get() and only write it to disk afterward - crashed with a
+    real MemoryError on hardware once the program file grew past
+    ~77KB (adding LOAD PROGRAM's library-sync code was what tipped it
+    over). Switched to http_download_to_file(), which streams straight
+    to disk in small chunks and never holds more than a few hundred
+    bytes in RAM regardless of file size - see that function's own
+    comment for the full reasoning. Returns (True, byte_count) - the
+    caller no longer gets the body text back, since it's already on
+    disk by the time this returns - or (False, message)."""
     wlan = connect_wifi()
     if wlan is None:
         return False, 'NO WIFI'
     url = 'https://raw.githubusercontent.com/{}/{}/{}/{}'.format(
         OTA_GH_OWNER, OTA_GH_REPO, OTA_GH_BRANCH, OTA_GH_PATH)
     try:
-        status, body = http_get(url, user_agent=WIKI_USER_AGENT, max_bytes=OTA_MAX_BYTES)
+        status, total = http_download_to_file(url, OTA_NEW_FILENAME,
+                                               user_agent=WIKI_USER_AGENT,
+                                               max_bytes=OTA_MAX_BYTES)
     except Exception as e:
         return False, 'NETWORK ERROR: {}'.format(e)
     if status != 200:
         return False, 'SERVER STATUS {}'.format(status)
-    return True, body
+    return True, total
+
+
+def _file_contains(path, needle, chunk_size=1024):
+    """Scans a file for `needle` (bytes) a chunk at a time, without
+    ever loading the whole file into RAM - used by OTA's post-download
+    sanity check, added alongside the streaming-download fix above so
+    the check itself doesn't reintroduce the same problem it's meant
+    to guard against. Overlaps each read by len(needle)-1 bytes so a
+    match straddling a chunk boundary is never missed."""
+    overlap = len(needle) - 1
+    prev_tail = b''
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    return False
+                if needle in (prev_tail + chunk):
+                    return True
+                prev_tail = chunk[-overlap:] if overlap else b''
+    except OSError:
+        return False
 
 
 def ota_check_flow():
@@ -553,16 +588,22 @@ def ota_check_flow():
         return
 
     send_screen(['SOFTWARE UPDATE', 'DOWNLOADING...', '', '', '', ''])
-    ok, body = _ota_fetch_program()
+    ok, result = _ota_fetch_program()
     if not ok:
-        send_screen(['SOFTWARE UPDATE', 'DOWNLOAD FAILED:', body[:COLS],
+        send_screen(['SOFTWARE UPDATE', 'DOWNLOAD FAILED:', result[:COLS],
                       '', 'NOTHING CHANGED.', '0=CONTINUE'])
         read_line()
         return
 
-    if isinstance(body, str):
-        body = body.encode('utf-8')
-    if len(body) < OTA_MIN_BYTES or b'def main()' not in body:
+    try:
+        new_size = os.stat(OTA_NEW_FILENAME)[6]
+    except OSError:
+        new_size = 0
+    if new_size < OTA_MIN_BYTES or not _file_contains(OTA_NEW_FILENAME, b'def main()'):
+        try:
+            os.remove(OTA_NEW_FILENAME)
+        except OSError:
+            pass
         send_screen(['SOFTWARE UPDATE', 'DOWNLOADED FILE LOOKS',
                       'WRONG - NOT INSTALLED.', '', 'NOTHING CHANGED.',
                       '0=CONTINUE'])
@@ -570,8 +611,6 @@ def ota_check_flow():
         return
 
     try:
-        with open(OTA_NEW_FILENAME, 'wb') as f:
-            f.write(body)
         try:
             os.remove(OTA_BACKUP_FILENAME)
         except OSError:
@@ -786,6 +825,92 @@ def http_get(url, timeout_s=10, max_redirects=3, user_agent=None, max_bytes=None
             continue
         return status_code, body.decode('utf-8', 'replace')
     return None, 'TOO MANY REDIRECTS'
+
+
+def http_download_to_file(url, dest_path, timeout_s=10, max_redirects=3,
+                           user_agent=None, max_bytes=None):
+    """Like http_get(), but streams the response body straight to a
+    file on disk instead of buffering it in RAM. Returns (status_code,
+    bytes_written); raises on network/socket errors, same as http_get().
+
+    FIX 2026-09-16: added after a real MemoryError during a SOFTWARE
+    UPDATE download once the program file grew past ~77KB.
+    http_get()'s max_bytes cap (added 2026-09-15 for ON THIS DAY, see
+    above) only bounds the WORST case - it doesn't help a normal-sized
+    download that's simply too big for a single accumulate-then-join
+    pass to survive alongside the TLS connection's own overhead. Every
+    caller that's ultimately just going to write the body to a file
+    anyway (SOFTWARE UPDATE, LOAD PROGRAM's library sync) should use
+    this instead of http_get() - it never holds more than one small
+    chunk (plus a capped header buffer) in memory at once, regardless
+    of how large the file on the other end is. Callers that need the
+    body as a string for parsing (Notes, Text Browser, OTA's own
+    version/sha checks) are unaffected and keep using http_get() - this
+    is purely for "download this to a file" callers."""
+    for _ in range(max_redirects + 1):
+        scheme, rest = url.split('://', 1)
+        host_part, _, path = rest.partition('/')
+        path = '/' + path
+        if ':' in host_part:
+            host, port_s = host_part.split(':', 1)
+            port = int(port_s)
+        else:
+            host = host_part
+            port = 443 if scheme == 'https' else 80
+
+        addr = socket.getaddrinfo(host, port)[0][-1]
+        s = socket.socket()
+        s.settimeout(timeout_s)
+        s.connect(addr)
+        if scheme == 'https':
+            s = ssl.wrap_socket(s, server_hostname=host)
+
+        req = 'GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n'.format(path, host)
+        if user_agent:
+            req += 'User-Agent: {}\r\n'.format(user_agent)
+        req += '\r\n'
+        s.write(req.encode())
+
+        # Read just the header block, a small chunk at a time (headers
+        # are always tiny - a few hundred bytes at most from either
+        # GitHub host used here), capped so a malformed/endless header
+        # section can't run away. Whatever body bytes happen to already
+        # be sitting in that same read past the '\r\n\r\n' terminator
+        # are kept as `leftover` and written first, below.
+        header_buf = b''
+        while b'\r\n\r\n' not in header_buf and len(header_buf) < 4096:
+            chunk = s.read(128)
+            if not chunk:
+                break
+            header_buf += chunk
+        header_bytes, _, leftover = header_buf.partition(b'\r\n\r\n')
+        header_lines = header_bytes.decode('ascii', 'replace').split('\r\n')
+        status_code = int(header_lines[0].split()[1])
+        headers = {}
+        for line in header_lines[1:]:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip().lower()] = v.strip()
+
+        if status_code in (301, 302, 303, 307, 308) and 'location' in headers:
+            s.close()
+            url = headers['location']
+            continue
+
+        total = 0
+        with open(dest_path, 'wb') as f:
+            if leftover:
+                f.write(leftover)
+                total += len(leftover)
+            while max_bytes is None or total < max_bytes:
+                chunk = s.read(512)
+                if not chunk:
+                    break
+                f.write(chunk)
+                total += len(chunk)
+        s.close()
+        return status_code, total
+    return None, 0
 
 
 def notes_send(text):

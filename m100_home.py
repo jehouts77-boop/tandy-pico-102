@@ -1949,14 +1949,245 @@ def games_menu_loop():
         games_menu()
 
 
+# ---------------------------------------------------------------------
+# LOAD PROGRAM module
+#
+# Added 2026-09-16. Design settled first (see the build log), but only
+# the LIBRARY SYNC half is built so far - getting .bas program listings
+# from a `programs/` folder in the same public GitHub repo used for
+# SOFTWARE UPDATE (see that section above) onto the Pico's own flash,
+# entirely over WiFi. This is deliberately the SAME mechanism as OTA,
+# just applied to a folder of files instead of one: GitHub's Contents
+# API can list a directory too, not just a single file, so the only
+# real difference is that this response is a JSON ARRAY (one object per
+# file) instead of one object - handled with the same hand-scanning
+# approach as onthisday_fetch()'s event array (_find_matching_bracket(),
+# _json_str_after()), pulling just each entry's "name" and "sha".
+#
+# The actual XMODEM-SEND-TO-THE-M100 half (picking a synced program and
+# streaming it to TELCOM) is NOT built yet - see the build log for that
+# design. This module only gets programs onto the Pico's own flash and
+# lets you confirm what's there; sending them onward is next.
+#
+# A small local manifest (PROGRAMS_MANIFEST_FILE, name<TAB>sha per line)
+# tracks which GitHub sha was last downloaded for each file, so a sync
+# only re-downloads something that's actually new or changed - same
+# "did this change" idea as OTA's local version file, just per-file.
+# ---------------------------------------------------------------------
+
+OTA_GH_PROGRAMS_DIR = 'programs'   # folder in the GitHub repo
+PROGRAMS_LOCAL_DIR = 'programs'    # folder on the Pico's own flash
+PROGRAMS_MANIFEST_FILE = 'programs_manifest.txt'
+PROGRAMS_MAX_BYTES = 50000       # generous for a BASIC listing
+PROGRAMS_LIST_MAX_BYTES = 8192   # cap for the folder-listing JSON itself
+
+
+def _programs_ensure_dir():
+    try:
+        os.mkdir(PROGRAMS_LOCAL_DIR)
+    except OSError:
+        pass  # already exists
+
+
+def _programs_read_manifest():
+    manifest = {}
+    try:
+        with open(PROGRAMS_MANIFEST_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or '\t' not in line:
+                    continue
+                name, sha = line.split('\t', 1)
+                manifest[name] = sha
+    except OSError:
+        pass
+    return manifest
+
+
+def _programs_write_manifest(manifest):
+    with open(PROGRAMS_MANIFEST_FILE, 'w') as f:
+        for name, sha in manifest.items():
+            f.write('{}\t{}\n'.format(name, sha))
+
+
+def _programs_list_remote():
+    """Lists the programs/ folder on GitHub via the Contents API - a
+    JSON ARRAY of file objects, unlike OTA's single-file check. Scanned
+    by hand the same way onthisday_fetch() scans its event array,
+    pulling just "name" and "sha" out of each entry rather than a full
+    json.loads(). Only .bas files are kept (case-insensitive), so a
+    stray README or similar in that folder is ignored automatically.
+    Returns (True, [(name, sha), ...]) or (False, message)."""
+    wlan = connect_wifi()
+    if wlan is None:
+        return False, 'NO WIFI'
+    url = 'https://api.github.com/repos/{}/{}/contents/{}?ref={}'.format(
+        OTA_GH_OWNER, OTA_GH_REPO, OTA_GH_PROGRAMS_DIR, OTA_GH_BRANCH)
+    try:
+        status, body = http_get(url, user_agent=WIKI_USER_AGENT,
+                                 max_bytes=PROGRAMS_LIST_MAX_BYTES)
+    except Exception as e:
+        return False, 'NETWORK ERROR: {}'.format(e)
+    if status == 404:
+        return False, 'NO programs/ FOLDER ON GITHUB YET'
+    if status != 200:
+        return False, 'SERVER STATUS {}'.format(status)
+
+    arr_open = body.find('[')
+    if arr_open == -1:
+        return False, 'BAD RESPONSE FROM GITHUB'
+    arr_close = _find_matching_bracket(body, arr_open)
+    if arr_close == -1:
+        arr_close = len(body)
+
+    entries = []
+    j = arr_open + 1
+    while j < arr_close:
+        while j < arr_close and body[j] in ' \t\r\n,':
+            j += 1
+        if j >= arr_close or body[j] != '{':
+            break
+        end = _find_matching_bracket(body, j)
+        if end == -1:
+            break
+        obj = body[j:end + 1]
+        name = _json_str_after(obj, '"name":"')
+        sha = _json_str_after(obj, '"sha":"')
+        if name.lower().endswith('.bas') and sha:
+            entries.append((name, sha))
+        j = end + 1
+
+    return True, entries
+
+
+def _programs_fetch_file(name):
+    """Downloads one program file's plain contents from
+    raw.githubusercontent.com - same idea as OTA's _ota_fetch_program(),
+    just parameterized by filename."""
+    wlan = connect_wifi()
+    if wlan is None:
+        return False, 'NO WIFI'
+    url = 'https://raw.githubusercontent.com/{}/{}/{}/{}/{}'.format(
+        OTA_GH_OWNER, OTA_GH_REPO, OTA_GH_BRANCH, OTA_GH_PROGRAMS_DIR, name)
+    try:
+        status, body = http_get(url, user_agent=WIKI_USER_AGENT,
+                                 max_bytes=PROGRAMS_MAX_BYTES)
+    except Exception as e:
+        return False, 'NETWORK ERROR: {}'.format(e)
+    if status != 200:
+        return False, 'SERVER STATUS {}'.format(status)
+    return True, body
+
+
+def programs_sync_flow():
+    send_screen(['SYNC LIBRARY', 'CHECKING GITHUB...', '', '', '', ''])
+    ok, remote = _programs_list_remote()
+    if not ok:
+        send_screen(['SYNC LIBRARY', 'COULD NOT CHECK:', remote[:COLS],
+                      '', '', '0=CONTINUE'])
+        read_line()
+        return
+
+    if not remote:
+        send_screen(['SYNC LIBRARY', 'NO PROGRAMS FOUND',
+                      'IN THE GITHUB REPO YET.', '', '', '0=CONTINUE'])
+        read_line()
+        return
+
+    _programs_ensure_dir()
+    manifest = _programs_read_manifest()
+
+    added = 0
+    updated = 0
+    failed = 0
+    for name, sha in remote:
+        if manifest.get(name) == sha:
+            continue
+        is_new = name not in manifest
+        send_screen(['SYNC LIBRARY', 'DOWNLOADING:', name[:COLS], '', '', ''])
+        ok, body = _programs_fetch_file(name)
+        if not ok:
+            failed += 1
+            continue
+        if isinstance(body, str):
+            body = body.encode('utf-8')
+        try:
+            with open('{}/{}'.format(PROGRAMS_LOCAL_DIR, name), 'wb') as f:
+                f.write(body)
+        except Exception:
+            failed += 1
+            continue
+        manifest[name] = sha
+        if is_new:
+            added += 1
+        else:
+            updated += 1
+
+    _programs_write_manifest(manifest)
+
+    send_screen([
+        'SYNC LIBRARY',
+        'DONE.',
+        'NEW: {}   UPDATED: {}'.format(added, updated)[:COLS],
+        'FAILED: {}'.format(failed) if failed else '',
+        '',
+        '0=CONTINUE',
+    ])
+    read_line()
+
+
+def programs_view_flow():
+    """Lists whatever .bas files are actually present in the local
+    programs/ folder right now - lets SYNC LIBRARY be checked without
+    needing Thonny/USB at all."""
+    _programs_ensure_dir()
+    try:
+        names = sorted(os.listdir(PROGRAMS_LOCAL_DIR))
+    except OSError:
+        names = []
+    lines = [n for n in names if n.lower().endswith('.bas')]
+    show_pages('INSTALLED PROGRAMS ({})'.format(len(lines)),
+                lines if lines else ['(NONE YET - TRY SYNC LIBRARY)'])
+
+
+def load_program_menu():
+    send_screen([
+        'LOAD PROGRAM - ENTER A NUMBER:',
+        ' 1  SYNC LIBRARY (WIFI)',
+        ' 2  VIEW INSTALLED PROGRAMS',
+        '',
+        '',
+        '0=BACK',
+    ])
+
+
+def load_program_menu_loop():
+    load_program_menu()
+    while True:
+        choice = read_line()
+        if choice == '0' or choice == '':
+            return
+        if choice == '1':
+            programs_sync_flow()
+        elif choice == '2':
+            programs_view_flow()
+        load_program_menu()
+
+
+# CHANGED 2026-09-16: dropped the standalone title row ('TANDY 102 -
+# ENTER A NUMBER:') to make room for a 6th item (LOAD PROGRAM) within
+# the confirmed ROWS=6 budget, rather than paginating the root menu.
+# Same "every row has to earn its place" reasoning as the COLS 40->39
+# and ROWS 8->6 changes above - a returning user doesn't need the
+# reminder, and this is the one screen that gets redrawn constantly.
 def home_menu():
     send_screen([
-        'TANDY 102 - ENTER A NUMBER:',
         ' 1  WIFI STATUS',
         ' 2  NOTES',
         ' 3  TEXT BROWSER',
         ' 4  HOME CONTROL',
         ' 5  GAMES & FUN STUFF',
+        ' 6  LOAD PROGRAM',
     ])
 
 
@@ -1978,6 +2209,9 @@ def main():
             home_menu()
         elif choice == '5':
             games_menu_loop()
+            home_menu()
+        elif choice == '6':
+            load_program_menu_loop()
             home_menu()
         else:
             home_menu()

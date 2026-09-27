@@ -913,6 +913,72 @@ def http_download_to_file(url, dest_path, timeout_s=10, max_redirects=3,
     return None, 0
 
 
+def http_post(url, body_bytes, headers=None, timeout_s=15, max_bytes=None):
+    """POST sibling to http_get() - same HTTP/1.0 + Connection: close
+    approach, socket+ssl by hand, no extra library. Returns
+    (status_code, body_text), decoded the same way http_get() does.
+    Raises on network/socket errors - callers wrap in try/except.
+
+    ADDED 2026-09-27 for ASK CLAUDE (see that module below): the only
+    caller right now is ask_claude(), and that call's response is
+    already small by construction (CLAUDE_MAX_TOKENS caps the reply),
+    so the max_bytes cap here is a backstop, not a fix for an observed
+    problem the way it was for ON THIS DAY - see http_get()'s docstring
+    for that story. No redirect-following - api.anthropic.com doesn't
+    issue any for this endpoint, unlike the Apps Script relay."""
+    scheme, rest = url.split('://', 1)
+    host_part, _, path = rest.partition('/')
+    path = '/' + path
+    if ':' in host_part:
+        host, port_s = host_part.split(':', 1)
+        port = int(port_s)
+    else:
+        host = host_part
+        port = 443 if scheme == 'https' else 80
+
+    addr = socket.getaddrinfo(host, port)[0][-1]
+    s = socket.socket()
+    s.settimeout(timeout_s)
+    s.connect(addr)
+    if scheme == 'https':
+        s = ssl.wrap_socket(s, server_hostname=host)
+
+    req_lines = [
+        'POST {} HTTP/1.0'.format(path),
+        'Host: {}'.format(host),
+        'Content-Type: application/json',
+        'Content-Length: {}'.format(len(body_bytes)),
+        'Connection: close',
+    ]
+    if headers:
+        for k, v in headers.items():
+            req_lines.append('{}: {}'.format(k, v))
+    req = '\r\n'.join(req_lines) + '\r\n\r\n'
+    s.write(req.encode())
+    s.write(body_bytes)
+
+    # Same accumulate-in-a-list-then-join pattern as http_get(), for the
+    # same reason (avoids repeated bytes += reallocating/copying the
+    # whole response on every chunk).
+    chunks = []
+    total = 0
+    while True:
+        chunk = s.read(512)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if max_bytes is not None and total >= max_bytes:
+            break
+    s.close()
+    resp = b''.join(chunks)
+
+    header_bytes, _, body = resp.partition(b'\r\n\r\n')
+    header_lines = header_bytes.decode('ascii', 'replace').split('\r\n')
+    status_code = int(header_lines[0].split()[1])
+    return status_code, body.decode('utf-8', 'replace')
+
+
 def notes_send(text):
     """POSTs (as a GET, to sidestep Apps Script's POST-redirect quirks)
     one note to the Apps Script relay. Returns (ok, message)."""
@@ -1589,15 +1655,100 @@ def quote_of_day_flow():
     show_pages('QUOTE OF THE DAY', result)
 
 
+# --- ASK CLAUDE module (added 2026-09-27) ---
+#
+# Single-shot Q&A against the real Claude API (api.anthropic.com) - not
+# the claude.ai subscription. Stateless by design (no conversation
+# history held in RAM): type one question, get one short answer, same
+# shape as wiki_lookup(). A real back-and-forth would need a message
+# history sent with every call, more memory pressure and more code -
+# possible later add, not the first version.
+#
+# CLAUDE_MAX_TOKENS caps the reply small on purpose: keeps it terminal-
+# sized (ROWS=6/COLS=39) and keeps this safe from the kind of MemoryError
+# an oversized response caused for ON THIS DAY (see that bug above) -
+# http_post()'s max_bytes is a backstop on top of that cap, not the
+# primary defense here.
+CLAUDE_MODEL = 'claude-haiku-4-5-20251001'
+CLAUDE_MAX_TOKENS = 120
+CLAUDE_MAX_BYTES = 4096
+
+
+def ask_claude(question):
+    """Returns (True, answer_text) or (False, message_for_the_screen)."""
+    wlan = connect_wifi()
+    if wlan is None:
+        return False, 'NO WIFI'
+
+    payload = {
+        'model': CLAUDE_MODEL,
+        'max_tokens': CLAUDE_MAX_TOKENS,
+        'messages': [{'role': 'user', 'content': question}],
+    }
+    body_bytes = json.dumps(payload).encode('utf-8')
+    headers = {
+        'x-api-key': secrets.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+    }
+
+    try:
+        status, body = http_post('https://api.anthropic.com/v1/messages',
+                                  body_bytes, headers=headers,
+                                  max_bytes=CLAUDE_MAX_BYTES)
+    except Exception as e:
+        return False, 'NETWORK ERROR: {}'.format(e)
+
+    if status != 200:
+        try:
+            err = json.loads(body)
+            msg = err.get('error', {}).get('message', '')
+        except Exception:
+            msg = ''
+        return False, 'API ERROR {}: {}'.format(status, msg[:COLS])
+
+    # Reply is small by construction (CLAUDE_MAX_TOKENS), so a full
+    # json.loads() here is safe - unlike ON THIS DAY's hand-scanning,
+    # there's no oversized-payload risk to design around.
+    try:
+        data = json.loads(body)
+        text = data['content'][0]['text']
+    except Exception:
+        return False, 'COULD NOT PARSE REPLY'
+
+    return True, ascii_safe(text.replace('\n', ' '))
+
+
+def ask_claude_flow():
+    send_screen(['ASK CLAUDE', '', 'TYPE YOUR QUESTION,',
+                  'THEN PRESS ENTER.', '', '0=BACK'])
+    question = read_line()
+    if not question or question == '0':
+        return
+
+    send_screen(['ASK CLAUDE', '', 'THINKING...', '', '', ''])
+    ok, result = ask_claude(question)
+    if not ok:
+        send_screen(['ASK CLAUDE', 'COULD NOT GET ANSWER:',
+                      result[:COLS], '', '', '0=CONTINUE'])
+        read_line()
+        return
+
+    show_pages('CLAUDE SAYS:', word_wrap(result, COLS))
+
+
 # --- Text Browser submenu ---
+#
+# CHANGED 2026-09-27: dropped the standalone title row to make room for
+# a 5th item (ASK CLAUDE) within the ROWS=6 budget - same trick already
+# used on home_menu() (see its own comment) when LOAD PROGRAM was added.
 
 def text_browser_menu():
     send_screen([
-        'TEXT BROWSER - ENTER A NUMBER:',
         ' 1  WIKIPEDIA LOOKUP',
         ' 2  HEADLINES (BBC NEWS)',
         ' 3  ON THIS DAY',
         ' 4  QUOTE OF THE DAY',
+        ' 5  ASK CLAUDE',
         '0=BACK',
     ])
 
@@ -1616,6 +1767,8 @@ def text_browser_menu_loop():
             on_this_day_flow()
         elif choice == '4':
             quote_of_day_flow()
+        elif choice == '5':
+            ask_claude_flow()
         text_browser_menu()
 
 
